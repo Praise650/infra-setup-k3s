@@ -1,0 +1,164 @@
+---
+# k3s cluster: 1 server + N agents, with UFW configured for flannel VXLAN.
+#
+# Ports between nodes (k3s networking requirements):
+#   6443/tcp   agents -> server   (API server; also opened publicly for kubectl)
+#   8472/udp   node <-> node      (flannel VXLAN - UDP, not TCP)
+#   10250/tcp  node <-> node      (kubelet: logs, exec, metrics)
+# Pod CIDR 10.42.0.0/16 and service CIDR 10.43.0.0/16 must be allowed,
+# including ROUTED traffic, because UFW defaults to "deny (routed)".
+
+- hosts: k8s_server
+  become: true
+  vars:
+    k3s_version: v1.36.4+k3s1
+    agent_ips: "{{ groups['k8s_agents'] | map('extract', hostvars, 'ansible_host') | list }}"
+  tasks:
+    - name: Install base packages
+      apt:
+        name: [curl, ufw]
+        update_cache: true
+
+    - name: Allow public ports
+      community.general.ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop: ["22", "80", "443", "6443"]
+
+    - name: Allow flannel VXLAN from agents
+      community.general.ufw:
+        rule: allow
+        src: "{{ item }}"
+        port: "8472"
+        proto: udp
+      loop: "{{ agent_ips }}"
+
+    - name: Allow kubelet from agents
+      community.general.ufw:
+        rule: allow
+        src: "{{ item }}"
+        port: "10250"
+        proto: tcp
+      loop: "{{ agent_ips }}"
+
+    - name: Allow pod and service CIDRs
+      community.general.ufw:
+        rule: allow
+        src: "{{ item }}"
+      loop: ["10.42.0.0/16", "10.43.0.0/16"]
+
+    - name: Allow routed pod traffic
+      community.general.ufw:
+        rule: allow
+        route: true
+        src: "{{ item.src | default(omit) }}"
+        dest: "{{ item.dest | default(omit) }}"
+      loop:
+        - { src: "10.42.0.0/16" }
+        - { dest: "10.42.0.0/16" }
+
+    - name: Enable firewall
+      community.general.ufw:
+        state: enabled
+
+    - name: Install k3s server
+      shell: >
+        curl -sfL https://get.k3s.io |
+        INSTALL_K3S_VERSION={{ k3s_version }}
+        INSTALL_K3S_EXEC="--tls-san {{ ansible_host }}"
+        sh -
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: Fetch kubeconfig to your laptop
+      fetch:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: ./kubeconfig
+        flat: true
+
+    - name: Point kubeconfig at the server's public IP
+      delegate_to: localhost
+      become: false
+      replace:
+        path: ./kubeconfig
+        regexp: 'https://127\.0\.0\.1:6443'
+        replace: "https://{{ ansible_host }}:6443"
+
+    - name: Read node token
+      slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: node_token
+      no_log: true
+
+    - name: Expose token as a fact for other hosts
+      set_fact:
+        k3s_token: "{{ node_token.content | b64decode | trim }}"
+      no_log: true
+
+
+- hosts: k8s_agents
+  become: true
+  vars:
+    k3s_version: v1.36.4+k3s1
+    server_host: "{{ groups['k8s_server'][0] }}"
+    server_ip: "{{ hostvars[server_host]['ansible_host'] }}"
+    peer_ips: "{{ ([server_ip] + (groups['k8s_agents'] | difference([inventory_hostname]) | map('extract', hostvars, 'ansible_host') | list)) }}"
+  tasks:
+    - name: Install base packages
+      apt:
+        name: [curl, ufw]
+        update_cache: true
+
+    - name: Allow SSH
+      community.general.ufw:
+        rule: allow
+        port: "22"
+        proto: tcp
+
+    - name: Allow flannel VXLAN from cluster peers
+      community.general.ufw:
+        rule: allow
+        src: "{{ item }}"
+        port: "8472"
+        proto: udp
+      loop: "{{ peer_ips }}"
+
+    - name: Allow kubelet from cluster peers
+      community.general.ufw:
+        rule: allow
+        src: "{{ item }}"
+        port: "10250"
+        proto: tcp
+      loop: "{{ peer_ips }}"
+
+    - name: Allow pod and service CIDRs
+      community.general.ufw:
+        rule: allow
+        src: "{{ item }}"
+      loop: ["10.42.0.0/16", "10.43.0.0/16"]
+
+    - name: Allow routed pod traffic
+      community.general.ufw:
+        rule: allow
+        route: true
+        src: "{{ item.src | default(omit) }}"
+        dest: "{{ item.dest | default(omit) }}"
+      loop:
+        - { src: "10.42.0.0/16" }
+        - { dest: "10.42.0.0/16" }
+
+    - name: Enable firewall
+      community.general.ufw:
+        state: enabled
+
+    - name: Install k3s agent and join cluster
+      shell: >
+        curl -sfL https://get.k3s.io |
+        INSTALL_K3S_VERSION={{ k3s_version }}
+        K3S_URL=https://{{ server_ip }}:6443
+        K3S_TOKEN={{ hostvars[server_host]['k3s_token'] }}
+        sh -
+      args:
+        creates: /usr/local/bin/k3s-agent-uninstall.sh
+      no_log: true

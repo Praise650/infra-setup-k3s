@@ -1,0 +1,69 @@
+- hosts: k8s_server
+  become: true
+  vars:
+    k3s_version: v1.36.4+k3s1
+  tasks:
+    - name: Install base packages
+      apt:
+        name: [curl, ufw]
+        update_cache: true
+
+    - name: Allow required ports
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop: ["22", "80", "443", "6443"]
+
+    - name: Enable firewall
+      ufw:
+        state: enabled
+
+    - name: Install k3s server
+      shell: curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION={{ k3s_version }} INSTALL_K3S_EXEC="--tls-san {{ ansible_host }}" sh -
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: Fetch kubeconfig to your laptop
+      fetch:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: ./kubeconfig
+        flat: true
+
+    - name: Read node token
+      slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: node_token
+
+    - name: Expose token as a fact for other hosts
+      set_fact:
+        k3s_token: "{{ node_token.content | b64decode | trim }}"
+
+- hosts: k8s_agents
+  become: true
+  tasks:
+    - name: Install base packages
+      apt:
+        name: [curl, ufw]
+        update_cache: true
+
+    - name: Allow required ports
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop: ["22", "6443", "8472", "10250"]
+
+    - name: Enable firewall
+      ufw:
+        state: enabled
+
+    - name: Install k3s agent and join cluster
+      shell: >
+        curl -sfL https://get.k3s.io |
+        INSTALL_K3S_VERSION=v1.36.4+k3s1
+        K3S_URL=https://{{ hostvars['myserver']['ansible_host'] }}:6443
+        K3S_TOKEN={{ hostvars['myserver']['k3s_token'] }}
+        sh -
+      args:
+        creates: /usr/local/bin/k3s-agent
